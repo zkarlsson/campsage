@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.log
+.env
+# local scan output / caches live outside the repo (in ~/campsage), but ignore if copied in:
+status.json
+wiki_images.json
+social_cache.json
+dashboard.html
