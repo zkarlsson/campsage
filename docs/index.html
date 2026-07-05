@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CampSage — never lose the campsite lottery again</title>
+<meta name="description" content="Find California campsites with 2–3 nights open at one site, closest to you, on an interactive map. Join the waitlist.">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: #0f1411; color: #e7efe9;
+    line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 680px; margin: 0 auto; padding: 48px 22px 60px; }
+  .logo { font-size: 42px; }
+  h1 { font-size: 30px; line-height: 1.2; margin: 10px 0 6px; }
+  h1 .g { color: #7fd1a8; }
+  .sub { font-size: 18px; color: #b9c9c0; margin-bottom: 26px; }
+  .card { background: #13201a; border: 1px solid #24382c; border-radius: 14px; padding: 18px 20px; margin: 14px 0; }
+  .feat { display: flex; gap: 12px; align-items: flex-start; margin: 14px 0; }
+  .feat .ic { font-size: 22px; flex: 0 0 auto; }
+  .feat b { color: #e7efe9; }
+  .feat span { color: #9db3a8; font-size: 14px; }
+  form { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  input[type=email] { flex: 1 1 220px; padding: 13px 14px; border-radius: 10px; border: 1px solid #2e7d5b;
+    background: #0f1411; color: #e7efe9; font-size: 16px; }
+  button { background: #2e7d5b; color: #fff; border: none; border-radius: 10px; padding: 13px 22px;
+    font-size: 16px; font-weight: 700; cursor: pointer; }
+  button:hover { background: #37946c; }
+  .note { font-size: 13px; color: #7d918a; margin-top: 10px; }
+  .honest { font-size: 13px; color: #7d918a; border-top: 1px solid #24382c; margin-top: 30px; padding-top: 18px; }
+  a { color: #7fd1a8; }
+  .setup { background:#2a1f0f; border:1px solid #6b5320; color:#e8d9b0; font-size:13px; padding:10px 14px; border-radius:10px; margin:18px 0; }
+</style></head>
+<body>
+<div class="wrap">
+  <div class="logo">🏕️</div>
+  <h1>Never lose the <span class="g">campsite lottery</span> again.</h1>
+  <p class="sub">The best California campsites sell out in seconds. CampSage hunts them for you —
+    and shows you exactly what's open, where, and how to grab it.</p>
+
+  <div class="card">
+    <div class="feat"><span class="ic">🗺️</span><div><b>See everything on a map</b><br>
+      <span>Every open site + beach, filtered by nights, weekend, region — tap a pin for photos, the exact open dates, and site numbers.</span></div></div>
+    <div class="feat"><span class="ic">🛏️</span><div><b>2–3 nights at one site</b><br>
+      <span>Not a random single night — actual consecutive stays you can book, ranked closest to you.</span></div></div>
+    <div class="feat"><span class="ic">🔔</span><div><b>Cancellation alerts (planned)</b><br>
+      <span>Get pinged the moment a sold-out spot opens up — the feature everyone actually wants.</span></div></div>
+    <div class="feat"><span class="ic">📷</span><div><b>Real photos</b><br>
+      <span>See what the place looks like before you commit — beaches, forests, the works.</span></div></div>
+  </div>
+
+  <div class="card">
+    <b style="font-size:18px">Want it? Get on the list.</b>
+    <p style="color:#9db3a8;font-size:14px;margin:4px 0 4px">I'm gauging interest before building the full version. Drop your email and I'll let you know when it's ready (and ask what you'd pay).</p>
+    <!-- SETUP: create a free form at https://formspree.io (30 sec), then replace YOUR_FORM_ID below -->
+    <form action="https://formspree.io/f/YOUR_FORM_ID" method="POST">
+      <input type="email" name="email" placeholder="you@email.com" required>
+      <button type="submit">Join the waitlist</button>
+    </form>
+    <p class="note">No spam. Just one email when it launches.</p>
+  </div>
+
+  <div class="setup">⚙️ <b>Owner note (delete before sharing):</b> the form needs a free
+    <a href="https://formspree.io">Formspree</a> endpoint — create one and paste your form ID over
+    <code>YOUR_FORM_ID</code>. Or swap the form for a Google Form / Tally link.</div>
+
+  <p class="honest">Early project, California-first, made by one person. It's not live yet — this page is
+    just testing whether people want it. The code is open-source on
+    <a href="https://github.com/dmaynard51/campsage">GitHub</a>.</p>
+</div>
+</body></html>
