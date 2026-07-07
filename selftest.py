@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """CampSage self-test — validates the whole pipeline end to end. Exit 0 = all pass."""
-import json, subprocess, time, urllib.request, urllib.parse, urllib.error
+import json, os, subprocess, time, urllib.request, urllib.parse, urllib.error
 from datetime import date, timedelta
+from pathlib import Path
 import config
+
+# In the docker-compose stack the scheduler is supercronic (crontab.scan) and the
+# concierge/doctor helpers (Claude-subscription, host-side) are not deployed.
+IN_CONTAINER = os.environ.get("CAMPSAGE_CONTAINER") == "1"
 
 PT = "https://www.recreation.gov"
 UA = {"User-Agent": config.USER_AGENT, "Accept": "application/json"}
@@ -47,13 +52,21 @@ try:
     check("status.json fresh (<24h)", age_h < 24, f"{age_h:.1f}h old")
     check("has campgrounds with openings", s["counts"]["with_openings"] > 0,
           f"{s['counts']['with_openings']} found")
-    check("results sorted closest-first",
-          all(s["results"][i]["distance"] <= s["results"][i+1]["distance"]
-              for i in range(len(s["results"])-1)))
-    check("all within max distance",
-          all(h["distance"] <= config.MAX_DISTANCE_MI for h in s["results"]))
-    check("all meet min rating",
-          all(h["rating"] >= config.MIN_RATING for h in s["results"]))
+    # results = everyday spots (closest-first, within the everyday radius) followed by
+    # far-destination finds (anchor search, region tabs only, within the outer cap).
+    everyday = [h for h in s["results"] if h.get("everyday", True)]
+    dest = [h for h in s["results"] if not h.get("everyday", True)]
+    check("everyday results sorted closest-first",
+          all(everyday[i]["distance"] <= everyday[i+1]["distance"]
+              for i in range(len(everyday)-1)))
+    check("everyday results within max distance",
+          all(h["distance"] <= config.MAX_DISTANCE_MI for h in everyday))
+    check("destination finds within outer cap",
+          all(h["distance"] <= config.REGION_MAX_DISTANCE_MI for h in dest))
+    # State parks (ReserveCalifornia) carry no review scores — rating is None by design.
+    check("all rated spots meet min rating",
+          all(h["rating"] >= config.MIN_RATING
+              for h in s["results"] if h.get("rating") is not None))
     check("openings respect night bounds",
           all(min(config.NIGHTS) <= o["nights"] <= max(config.NIGHTS)
               for h in s["results"] for o in h["openings"]))
@@ -64,7 +77,11 @@ except Exception as e:
 
 # 3. a claimed opening is independently real (merge months — a block can cross a boundary)
 try:
-    h = s["results"][0]; o = h["openings"][0]
+    # Re-verify against recreation.gov, so pick a federal campground (state parks/beaches
+    # merged into results live on ReserveCalifornia and have non-rec.gov ids).
+    h = next(h for h in s["results"]
+             if not h.get("state_park") and not h.get("state_beach") and h.get("openings"))
+    o = h["openings"][0]
     need = [(date.fromisoformat(o["start"]) + timedelta(days=i)).isoformat()
             for i in range(o["nights"])]
     merged = {}  # site_id -> {date: status}, across every month the block touches
@@ -147,21 +164,33 @@ try:
 except Exception as e:
     check("/camp serves on :5001", False, str(e))
 
-# 5. booking tips + health + cron presence
-check("booking_tips.json present", config.TIPS_JSON.exists())
-try:
-    H = json.loads(config.HEALTH_JSON.read_text())
-    check("doctor health is HEALTHY", H.get("status") == "HEALTHY",
-          f"{H.get('status')} — {H.get('summary','')}")
-except Exception as e:
-    check("doctor health present", False, str(e))
-try:
-    cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
-    check("cron scan job installed", "campsage_app" in cron)
-    check("cron concierge job installed", "ai_concierge.sh" in cron)
-    check("cron doctor job installed", "campsage_doctor.sh" in cron)
-except Exception as e:
-    check("cron jobs installed", False, str(e))
+# 5. booking tips + health + schedule presence
+if IN_CONTAINER:
+    # Concierge/doctor are Claude-subscription host-side helpers, not part of the container
+    # stack — the page degrades gracefully without their JSON. Scheduler is supercronic.
+    skip("booking_tips.json present", "concierge not deployed in container stack")
+    skip("doctor health present", "doctor not deployed in container stack")
+    try:
+        cron = Path("/app/crontab.scan").read_text()
+        check("scan schedule installed (supercronic)",
+              "camp_agent.py" in cron and "camp_wiki_images.py" in cron)
+    except Exception as e:
+        check("scan schedule installed (supercronic)", False, str(e))
+else:
+    check("booking_tips.json present", config.TIPS_JSON.exists())
+    try:
+        H = json.loads(config.HEALTH_JSON.read_text())
+        check("doctor health is HEALTHY", H.get("status") == "HEALTHY",
+              f"{H.get('status')} — {H.get('summary','')}")
+    except Exception as e:
+        check("doctor health present", False, str(e))
+    try:
+        cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+        check("cron scan job installed", "campsage_app" in cron)
+        check("cron concierge job installed", "ai_concierge.sh" in cron)
+        check("cron doctor job installed", "campsage_doctor.sh" in cron)
+    except Exception as e:
+        check("cron jobs installed", False, str(e))
 
 print("\nRESULT:", "ALL PASS ✅" if ok else "SOME CHECKS FAILED ❌")
 raise SystemExit(0 if ok else 1)

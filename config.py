@@ -7,6 +7,7 @@ among well-reviewed spots, and publishes a phone-friendly status page.
 
 Everything tunable lives here. Edit + re-run camp_agent.py (or wait for cron).
 """
+import os
 from pathlib import Path
 
 # ── Where "closest" is measured from (home base for drive distance) ───────────
@@ -96,7 +97,8 @@ STATE_PARK_PER_ANCHOR  = 6      # nearest campable state parks kept per region (
 STATE_PARK_MAX_ANALYZE = 45     # global cap on parks we fetch availability for (API budget)
 
 # ── Plumbing ──────────────────────────────────────────────────────────────────
-DATA_DIR      = Path.home() / "campsage"
+# Overridable for containerized runs (docker-compose sets CAMPSAGE_DATA_DIR=/data).
+DATA_DIR      = Path(os.environ.get("CAMPSAGE_DATA_DIR", Path.home() / "campsage"))
 STATUS_JSON   = DATA_DIR / "status.json"
 DASHBOARD_HTML= DATA_DIR / "dashboard.html"
 TIPS_JSON     = DATA_DIR / "booking_tips.json"   # written by ai_concierge.sh (subscription)

@@ -1,0 +1,27 @@
+# CampSage on the Synology (cumulus): web UI + cron scanner sharing one data volume.
+# Host port 5055 (DSM owns 5000/5001). Access over Tailscale: http://<nas-tailscale-ip>:5055/camp
+services:
+  web:
+    build: .
+    image: campsage:latest
+    ports:
+      - "5055:5001"
+    volumes:
+      - campsage-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5001/camp"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  scanner:
+    image: campsage:latest
+    build: .
+    command: ./scan-entrypoint.sh
+    volumes:
+      - campsage-data:/data
+    restart: unless-stopped
+
+volumes:
+  campsage-data:

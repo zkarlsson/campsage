@@ -14,10 +14,11 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
-STATUS = Path.home() / "campsage" / "status.json"
-CACHE = Path.home() / "campsage" / "wiki_images.json"
+import config
+
+STATUS = config.STATUS_JSON
+CACHE = config.DATA_DIR / "wiki_images.json"
 UA = {"User-Agent": "CampSage/1.0 (personal campsite finder)"}
 MAX_IMGS = 5
 _SKIP = re.compile(r"(map|logo|icon|locator|seal|diagram|coat_of_arms|flag|svg)", re.I)
