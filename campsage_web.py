@@ -6,14 +6,20 @@ map (Leaflet + OpenStreetMap, no API keys) for every saved location camp_agent.p
 no locations.json) keep working until the first new-style scan lands.
 Run:  python campsage_web.py   (then open http://localhost:5001/camp)
 """
+import html
 import json
+import re
+import urllib.parse
 from pathlib import Path
-from flask import Flask, jsonify, Response, redirect
+from flask import Flask, jsonify, Response, redirect, request
 
 import config
+import locations
 
 DATA = config.DATA_DIR
 app = Flask(__name__)
+
+_BACK_RE = re.compile(r"^/camp(/[a-z0-9-]+)?$")   # referrer allowlist (no open redirect)
 
 
 def load_json_safe(path, default=None):
@@ -39,6 +45,148 @@ def _unknown(idx):
     slugs = ", ".join(_known_slugs(idx)) or "(none scanned yet)"
     return (f"<body style='font:16px sans-serif;padding:40px'>Unknown location. "
             f"Known: {slugs}</body>", 404)
+
+
+def _store():
+    """The runtime location store, or None if unreadable/unseeded (web never seeds —
+    that's the scanner's job; without a store we fall back to index-only pills)."""
+    try:
+        return locations.read_store()
+    except Exception:
+        return None
+
+
+# ── live location bar (replaces the scan-time-baked pills at serve time) ──────
+_LOCBAR_STYLE = """<style>
+  .locpill.pending{opacity:.55;cursor:default}
+  .locpill.editbtn{background:none;border-style:dashed;cursor:pointer;font:inherit}
+  .locedit{display:none;margin-top:8px;padding:10px;background:#13201a;
+           border:1px solid #25382e;border-radius:10px}
+  .locedit.open{display:block}
+  .locedit form{display:inline-flex;gap:6px;margin:3px 8px 3px 0;vertical-align:middle}
+  .locedit input{background:#0f1411;border:1px solid #2d4a3b;color:#e7efe9;
+                 border-radius:8px;padding:7px 10px;font-size:14px;max-width:150px}
+  .locedit button{background:#1f8a4c;color:#fff;border:none;border-radius:8px;
+                  padding:7px 12px;font-size:13px;font-weight:600;cursor:pointer}
+  .locedit .rm button{background:#5a2626}
+  .locerr{color:#e08a8a;font-size:13px;margin-top:6px}
+  .lochint{color:#6f9583;font-size:12px;margin-top:6px}
+</style>"""
+
+
+def _locbar(active_slug, err=None):
+    """Pill row + edit panel built from the CURRENT store/index (not the scan-time
+    bake): scanned locations link, store-only ones show as ⏳ pending."""
+    store, idx = _store(), _index()
+    scanned = set(_known_slugs(idx))
+    entries = (store or {}).get("locations") or \
+              [{"slug": e.get("slug"), "name": e.get("name", e.get("slug"))}
+               for e in (idx or {}).get("locations", [])]
+    if not entries:
+        return ""
+    e_ = lambda s: html.escape(str(s), quote=True)
+    pills, removes = [], []
+    for e in entries:
+        slug, name = e.get("slug"), e.get("name") or e.get("slug")
+        if slug in scanned:
+            pills.append(f"<a class='locpill{' on' if slug == active_slug else ''}' "
+                         f"href='/camp/{e_(slug)}'>📍 {e_(name)}</a>")
+        else:
+            pills.append(f"<span class='locpill pending' title='first scan queued — "
+                         f"usually ready within ~30 min'>⏳ {e_(name)}</span>")
+        removes.append(
+            f"<form class='rm' method='post' action='/camp/locations/remove' "
+            f"onsubmit=\"return confirm('Remove {e_(name)} for everyone?')\">"
+            f"<input type='hidden' name='slug' value='{e_(slug)}'>"
+            f"<button>✕ {e_(name)}</button></form>")
+    edit_ui = ""
+    if store:                                      # no store → view-only pills
+        removes_html = "".join(removes) if len(entries) > 1 else ""
+        err_html = f"<div class='locerr'>{e_(err)}</div>" if err else ""
+        edit_ui = (
+            "<button class='locpill editbtn' title='add / remove locations' "
+            "onclick=\"document.getElementById('locedit').classList.toggle('open')\">✎</button>"
+            f"</div><div class='locedit{' open' if err else ''}' id='locedit'>{removes_html}"
+            "<form method='post' action='/camp/locations/add'>"
+            "<input name='query' placeholder='zip or city, ST' required maxlength='120'>"
+            "<input name='name' placeholder='label (optional)' maxlength='40'>"
+            "<button>+ Add</button></form>"
+            f"{err_html}"
+            "<div class='lochint'>Shared with everyone on this deployment. A new "
+            "location's first scan takes ~15–30 min (waits for any scan in progress)."
+            "</div>")
+    if not edit_ui:
+        pills.append("")                           # keep the closing div balanced
+    return (_LOCBAR_STYLE + "<div class='locs'>" + "".join(pills) + edit_ui + "</div>")
+
+
+def _inject_locbar(body, active_slug, err=None):
+    """Swap the scan-time-baked pill block for the live bar. No markers (pre-upgrade
+    bake) → serve unchanged; the next cron re-bake adds them."""
+    start, end = body.find("<!--LOCS-->"), body.find("<!--/LOCS-->")
+    if start == -1 or end == -1 or end < start:
+        return body
+    return body[:start] + _locbar(active_slug, err) + body[end + len("<!--/LOCS-->"):]
+
+
+def _pending_page(slug, store):
+    name = next((e.get("name", slug) for e in store.get("locations", [])
+                 if e.get("slug") == slug), slug)
+    e_ = lambda s: html.escape(str(s), quote=True)
+    return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            f"<meta http-equiv='refresh' content='60'>"
+            f"<title>🏕️ CampSage — {e_(name)}</title>"
+            f"<style>:root{{color-scheme:dark}}body{{margin:0;font:16px/1.5 -apple-system,"
+            f"system-ui,sans-serif;background:#0f1411;color:#e7efe9;padding:20px}}"
+            f".locs{{display:flex;gap:8px;overflow-x:auto;margin-bottom:18px}}"
+            f".locpill{{flex:0 0 auto;padding:6px 12px;border:1px solid #2d4a3b;"
+            f"background:#16271f;color:#cfe9da;border-radius:20px;font-size:13px;"
+            f"font-weight:600;text-decoration:none}}"
+            f".locpill.on{{background:#1f8a4c;color:#fff;border-color:#1f8a4c}}</style>"
+            f"</head><body>{_locbar(slug)}"
+            f"<h2>⏳ Scanning {e_(name)}…</h2>"
+            f"<p style='color:#9bbfac'>First results usually appear within ~30 minutes "
+            f"(a new location waits for any in-progress scan to finish, then scans at a "
+            f"deliberately polite pace). This page refreshes itself.</p></body></html>")
+
+
+def _back(default="/camp"):
+    ref = request.referrer or ""
+    try:
+        path = urllib.parse.urlparse(ref).path
+    except Exception:
+        return default
+    return path if _BACK_RE.match(path or "") else default
+
+
+@app.route("/camp/locations/add", methods=["POST"])
+def locations_add():
+    try:
+        entry = locations.add_location(request.form.get("query", ""),
+                                       request.form.get("name", ""))
+    except ValueError as e:
+        return redirect(_back() + "?err=" + urllib.parse.quote(str(e)))
+    except Exception:
+        return redirect(_back() + "?err=" + urllib.parse.quote(
+            "Something went wrong saving that location."))
+    return redirect(f"/camp/{entry['slug']}")
+
+
+@app.route("/camp/locations/remove", methods=["POST"])
+def locations_remove():
+    slug = request.form.get("slug", "")
+    try:
+        locations.remove_location(slug)
+    except ValueError as e:
+        return redirect(_back() + "?err=" + urllib.parse.quote(str(e)))
+    except Exception:
+        return redirect(_back() + "?err=" + urllib.parse.quote(
+            "Something went wrong removing that location."))
+    back = _back()
+    if back.rstrip("/").endswith(f"/{slug}"):      # was viewing the removed city
+        back = "/camp"
+    return redirect(back)
 
 
 @app.route("/")
@@ -68,13 +216,15 @@ def camp_data():
 @app.route("/camp/<slug>")
 def camp_page_loc(slug):
     idx = _index()
-    if not idx or slug not in _known_slugs(idx):
-        return _unknown(idx)
+    store = _store()
+    store_slugs = {e.get("slug") for e in (store or {}).get("locations", [])}
+    err = request.args.get("err")
     f = DATA / "locations" / slug / "dashboard.html"
-    if f.exists():
-        return f.read_text()
-    return ("<body style='font:16px sans-serif;padding:40px'>This location hasn't been "
-            "scanned yet \u2014 the next cron run will populate it.</body>", 200)
+    if slug in _known_slugs(idx) and f.exists():
+        return _inject_locbar(f.read_text(), slug, err)
+    if slug in store_slugs:                        # added, first scan still queued
+        return _pending_page(slug, store)
+    return _unknown(idx)
 
 
 @app.route("/camp/<slug>/data")

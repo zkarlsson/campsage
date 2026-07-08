@@ -18,7 +18,12 @@ python3 camp_wiki_images.py       # (optional) fetch beach/park photos from Wiki
 python3 campsage_web.py           # serve it -> open http://localhost:5001/camp
 ```
 URLs: `/camp` redirects to the default location; each location lives at `/camp/<slug>`
-(`/camp/<slug>/map`, `/camp/<slug>/data`). The page header has a location-switcher pill row.
+(`/camp/<slug>/map`, `/camp/<slug>/data`). The page header has a location-switcher pill row
+with a ✎ button to **add or remove locations at runtime** (shared deployment-wide; capped at
+`MAX_LOCATIONS`). Adds geocode immediately, show a ⏳ pill, and get scanned within minutes by
+`scan_pending.py` (which queues behind any running scan — scans are strictly serialized via a
+scan lock because recreation.gov enforces an adaptive per-IP quota). The runtime location list
+lives in `DATA_DIR/locations_config.json`; `config.LOCATIONS` only seeds it on first run.
 Region tabs are statewide: only anchors within ~300 mi of a location are searched, so an
 Oakland scan gets Point Reyes/Tahoe/Big Sur tabs while an LA scan keeps Big Bear/Ojai/Joshua
 Tree — API load stays flat per location.

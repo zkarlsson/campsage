@@ -11,15 +11,18 @@ import os
 from pathlib import Path
 
 # ── Where "closest" is measured from ──────────────────────────────────────────
-# Saved scan origins: the scanner runs once per entry; the page gets a location
-# switcher. "query" is a zip or address (geocoded keylessly at scan time, cached
-# forever); explicit "lat"/"lng" skip geocoding entirely — the escape hatch if the
-# geocoder is ever unreachable. Slugs derive from "name" ("Los Angeles" → los-angeles).
+# SEEDS ONLY: the runtime source of truth is DATA_DIR/locations_config.json, edited
+# from the web UI's pill bar (✎ → add/remove, shared deployment-wide). These entries
+# populate that store the FIRST time it's created — delete the store file to re-seed.
+# "query" is a zip or address (geocoded keylessly, cached forever); explicit
+# "lat"/"lng" skip geocoding. Slugs derive from "name" ("Los Angeles" → los-angeles).
 LOCATIONS = [
     {"name": "Los Angeles", "query": "Los Angeles, CA", "lat": 34.0522, "lng": -118.2437},
     {"name": "Oakland",     "query": "94607"},
 ]
-DEFAULT_LOCATION = "oakland"        # slug served at /camp
+DEFAULT_LOCATION = "oakland"        # slug served at /camp (seed; store tracks changes)
+MAX_LOCATIONS    = 6                # add-location cap — each location costs a full
+                                    # recreation.gov scan 3×/day (per-IP quota is real)
 
 # ── How far you'll drive + how good a spot has to be ──────────────────────────
 SEARCH_RADIUS_MI = 150      # recreation.gov search radius (miles)

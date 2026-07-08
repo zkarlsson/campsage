@@ -68,15 +68,15 @@ def _nominatim(query):
     return float(d[0]["lat"]), float(d[0]["lon"]), d[0].get("display_name", query)
 
 
-def geocode(query):
-    """(lat, lng) for a zip or address string. Cached forever; raises on failure."""
+def lookup(query):
+    """(lat, lng, display) for a zip or address string. Cached forever; raises on failure."""
     key = re.sub(r"\s+", " ", str(query)).strip().lower()
     if not key:
         raise RuntimeError("empty geocode query")
     cache = _load_cache()
     hit = cache.get(key)
     if hit:
-        return hit["lat"], hit["lng"]
+        return hit["lat"], hit["lng"], hit.get("display", query)
     try:
         if re.fullmatch(r"\d{5}", key):
             lat, lng, display = _zippopotam(key)
@@ -88,6 +88,12 @@ def geocode(query):
         raise RuntimeError(f"geocoding {query!r} failed: {e}") from e
     cache[key] = {"lat": lat, "lng": lng, "display": display, "ts": int(time.time())}
     _save_cache(cache)
+    return lat, lng, display
+
+
+def geocode(query):
+    """(lat, lng) — see lookup()."""
+    lat, lng, _ = lookup(query)
     return lat, lng
 
 

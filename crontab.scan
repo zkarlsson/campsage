@@ -1,3 +1,6 @@
 # CampSage scan schedule (container TZ=America/Los_Angeles).
 # 7am catches recreation.gov's rolling 6-month release; midday + evening catch cancellations.
 0 7,13,18 * * * cd /app && python3 camp_agent.py && python3 camp_wiki_images.py
+# Pick up locations added from the web UI (exits instantly when none are pending;
+# queues behind any running scan via the scan lock — scans never overlap).
+* * * * * cd /app && python3 scan_pending.py

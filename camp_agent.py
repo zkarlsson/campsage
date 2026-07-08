@@ -909,16 +909,15 @@ def render_html(status, loc=None, all_locs=None):
                  "recreation.gov · 📺 “social buzz” = YouTube popularity, not a satisfaction "
                  "rating · island camping excluded.</div>")
 
-    # Location switcher: one pill per saved scan origin, baked in at render time.
-    # (A location added to config shows up here after the next scan re-renders — noted,
-    # self-heals on the following cron tick.)
-    switcher_html = ""
-    if all_locs and len(all_locs) > 1:
-        pills = "".join(
-            f"<a class='locpill{' on' if l.slug == loc.slug else ''}' "
-            f"href='/camp/{esc(l.slug)}'>📍 {esc(l.name)}</a>"
-            for l in all_locs)
-        switcher_html = f"<div class='locs'>{pills}</div>"
+    # Location switcher: pills baked at render time as a fallback, wrapped in marker
+    # comments so campsage_web can swap in a LIVE bar (current store + edit UI) at
+    # serve time. A dashboard.html opened straight from disk still shows these pills;
+    # a pre-marker web build serves them verbatim.
+    pills = "".join(
+        f"<a class='locpill{' on' if l.slug == loc.slug else ''}' "
+        f"href='/camp/{esc(l.slug)}'>📍 {esc(l.name)}</a>"
+        for l in (all_locs or [loc]))
+    switcher_html = f"<!--LOCS--><div class='locs'>{pills}</div><!--/LOCS-->"
 
     page = f"""<!doctype html>
 <html lang="en"><head>
@@ -1111,20 +1110,37 @@ def log(msg):
         pass
 
 
-def main():
+def scan(only_slugs=None):
+    """Scan saved locations sequentially, holding the scan lock for the whole run —
+    scans must NEVER overlap (recreation.gov's per-IP quota punishes concurrency).
+    The store is re-checked before each location so a removal made from the web UI
+    mid-run is honored."""
     global LOG_PREFIX
-    locs = locations.load_locations()      # geocodes up front; exits loudly on failure
+    locs = locations.load_locations()      # resolves store; exits loudly on failure
+    todo = [l for l in locs if l.slug in only_slugs] if only_slugs else locs
+    if only_slugs and not todo:
+        sys.exit(f"unknown location(s) {only_slugs!r}; "
+                 f"saved: {', '.join(l.slug for l in locs)}")
+    with locations.scan_lock(blocking=True):
+        first = True
+        for loc in todo:
+            current = {l.slug for l in locations.load_locations()}
+            if loc.slug not in current:
+                log(f"[{loc.slug}] removed while waiting — skipping")
+                continue
+            if not first:
+                time.sleep(120)            # let the API's trailing quota window slide
+            first = False
+            LOG_PREFIX = f"[{loc.slug}] " if len(locs) > 1 else ""
+            status = run(loc, locations.load_locations())
+            locations.update_index(loc, status)     # index valid after EVERY location
+        LOG_PREFIX = ""
+        locations.prune_orphan_dirs()
+
+
+def main():
     only = sys.argv[sys.argv.index("--location") + 1] if "--location" in sys.argv else None
-    todo = [l for l in locs if l.slug == only] if only else locs
-    if only and not todo:
-        sys.exit(f"unknown location {only!r}; configured: {', '.join(l.slug for l in locs)}")
-    for i, loc in enumerate(todo):
-        if i:
-            time.sleep(120)                # let the API's trailing quota window slide
-        LOG_PREFIX = f"[{loc.slug}] " if len(locs) > 1 else ""
-        status = run(loc, locs)
-        locations.update_index(loc, status, locs)   # index valid after EVERY location
-    LOG_PREFIX = ""
+    scan([only] if only else None)
 
 
 if __name__ == "__main__":

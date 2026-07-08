@@ -202,11 +202,47 @@ try:
 except Exception as e:
     check("recreation.gov search API", False, str(e))
 
-# 1b. locations index sanity (multi-location layout only)
+# 1b. locations index + runtime store sanity (multi-location layout only)
 if index is not None:
     idx_slugs = [e[0] for e in entries]
     check("locations.json lists every configured location",
           bool(idx_slugs), ", ".join(idx_slugs))
+    try:
+        store = json.loads((config.DATA_DIR / "locations_config.json").read_text())
+        s_slugs = [e["slug"] for e in store.get("locations", [])]
+        check("location store parses + populated", bool(s_slugs), ", ".join(s_slugs))
+        check("index slugs ⊆ store slugs",
+              set(e.get("slug") for e in index.get("locations", [])) <= set(s_slugs))
+        check("store default is a stored location", store.get("default") in s_slugs)
+        check("store within MAX_LOCATIONS",
+              len(s_slugs) <= getattr(config, "MAX_LOCATIONS", 6))
+        check("store entries fully resolved (lat/lng)",
+              all(e.get("lat") is not None and e.get("lng") is not None
+                  for e in store.get("locations", [])))
+    except Exception as e:
+        check("location store parses + populated", False, str(e))
+    try:
+        body = http_body(f"http://127.0.0.1:5001/camp/{idx_slugs[0]}")
+        check("edit UI injected (add form present)", "/camp/locations/add" in body)
+    except Exception as e:
+        check("edit UI injected (add form present)", False, str(e))
+    try:
+        import urllib.request as _ur
+
+        class _NoRedirect(_ur.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        try:
+            _ur.build_opener(_NoRedirect).open(
+                "http://127.0.0.1:5001/camp/locations/remove",
+                data=b"slug=no-such-place", timeout=15)
+            check("bogus remove rejected gracefully (no 500)", False, "no redirect")
+        except urllib.error.HTTPError as e:
+            check("bogus remove rejected gracefully (no 500)",
+                  e.code == 302 and "err=" in (e.headers.get("Location") or ""),
+                  f"{e.code} -> {e.headers.get('Location','')[:60]}")
+    except Exception as e:
+        check("bogus remove rejected gracefully (no 500)", False, str(e))
     try:
         r = urllib.request.urlopen("http://127.0.0.1:5001/camp", timeout=15)
         check("/camp lands on the default location",
