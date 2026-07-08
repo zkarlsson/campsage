@@ -10,10 +10,16 @@ Everything tunable lives here. Edit + re-run camp_agent.py (or wait for cron).
 import os
 from pathlib import Path
 
-# ── Where "closest" is measured from (home base for drive distance) ───────────
-HOME_NAME = "Los Angeles"
-HOME_LAT  = 34.0522
-HOME_LNG  = -118.2437
+# ── Where "closest" is measured from ──────────────────────────────────────────
+# Saved scan origins: the scanner runs once per entry; the page gets a location
+# switcher. "query" is a zip or address (geocoded keylessly at scan time, cached
+# forever); explicit "lat"/"lng" skip geocoding entirely — the escape hatch if the
+# geocoder is ever unreachable. Slugs derive from "name" ("Los Angeles" → los-angeles).
+LOCATIONS = [
+    {"name": "Los Angeles", "query": "Los Angeles, CA", "lat": 34.0522, "lng": -118.2437},
+    {"name": "Oakland",     "query": "94607"},
+]
+DEFAULT_LOCATION = "oakland"        # slug served at /camp
 
 # ── How far you'll drive + how good a spot has to be ──────────────────────────
 SEARCH_RADIUS_MI = 150      # recreation.gov search radius (miles)
@@ -41,7 +47,12 @@ BEACH_MAX_DISTANCE = 175     # miles from home; covers Pismo/El Capitán up the 
 # A ReserveCalifornia place is "beach camping" if its name ends in " SB" (State Beach) or
 # contains the word Beach, or is one of these coastal State Parks that have camping…
 BEACH_ALLOW = ("Leo Carrillo SP", "Point Mugu SP", "Crystal Cove SP Moro Campground",
-               "Gaviota SP", "Montana De Oro SP", "Morro Bay SP")
+               "Gaviota SP", "Montana De Oro SP", "Morro Bay SP",
+               # NorCal coastal camping whose names lack "Beach"/" SB" (names verified
+               # against the live RDR API 2026-07-07; note "Mackerricher" lowercase k
+               # and Sue-meg = the renamed Patrick's Point):
+               "Sonoma Coast State Park", "Salt Point SP", "Russian Gulch SP",
+               "Van Damme SP", "Mackerricher SP", "Sue-meg SP")
 # …but never these (inland, lakes, cottages/trailers, off-highway dune areas).
 BEACH_VETO  = ("Cottages", "Trailers", "Lake", "SRA", "SVRA", "SHP", "Reservoir", "Desert")
 
@@ -74,6 +85,32 @@ REGION_ANCHORS = [
     # Anza-Borrego are top bucket-list demand and in LA range, but had no anchor so were never searched).
     ("Joshua Tree",           34.000, -116.160),
     ("Anza-Borrego Desert",   33.270, -116.410),
+    # ── Statewide expansion (2026-07-07, multi-location support) ──────────────
+    # Only anchors within REGION_MAX_DISTANCE_MI of a given location are searched
+    # (locations.active_anchors), so adding anchors here does NOT grow per-scan API
+    # load — a SoCal scan never touches Tahoe and vice versa. Coords are approximate
+    # region centers; a slightly-off anchor only mislabels a tab.
+    ("Kern River / S. Sequoia",     35.790, -118.440),
+    ("Sequoia / Kings Canyon",      36.600, -118.750),
+    ("Eastern Sierra / Mammoth",    37.630, -118.970),
+    ("Death Valley",                36.460, -116.870),
+    ("Shaver / Huntington Lakes",   37.120, -119.280),
+    ("Yosemite",                    37.740, -119.600),
+    ("Gold Country / Stanislaus",   38.250, -120.300),
+    ("Lake Tahoe",                  38.950, -120.050),
+    ("Plumas / Feather River",      39.940, -120.950),
+    ("Lassen",                      40.490, -121.420),
+    ("Mt Shasta / Castle Crags",    41.150, -122.300),
+    ("Trinity Alps",                40.850, -122.800),
+    ("Redwood Coast / Del Norte",   41.550, -124.080),
+    ("Humboldt Redwoods",           40.310, -123.920),
+    ("Mendocino Coast",             39.310, -123.800),
+    ("Sonoma Coast / Russian River", 38.440, -123.100),
+    ("Clear Lake",                  38.980, -122.750),
+    ("Point Reyes / Marin",         38.070, -122.800),
+    ("East Bay / Mt Diablo",        37.880, -121.930),
+    ("Santa Cruz Mountains",        37.170, -122.220),
+    ("Monterey / Carmel",           36.550, -121.920),
 ]
 
 # Far destinations (e.g. Big Sur ~250mi) sit beyond the everyday LA radius and the
@@ -94,11 +131,13 @@ REGION_MAX_PER_TAB      = 12    # cap destination campgrounds kept per far regio
 # exist in ReserveCalifornia, so these rank by distance/soonest like the beaches do.
 STATE_PARKS_ENABLED    = True
 STATE_PARK_PER_ANCHOR  = 6      # nearest campable state parks kept per region (bounds API load)
-STATE_PARK_MAX_ANALYZE = 45     # global cap on parks we fetch availability for (API budget)
+STATE_PARK_MAX_ANALYZE = 60     # per-location cap on parks we fetch availability for (API budget)
 
 # ── Plumbing ──────────────────────────────────────────────────────────────────
 # Overridable for containerized runs (docker-compose sets CAMPSAGE_DATA_DIR=/data).
 DATA_DIR      = Path(os.environ.get("CAMPSAGE_DATA_DIR", Path.home() / "campsage"))
+# Legacy single-location paths — current output lives under DATA_DIR/locations/<slug>/
+# (see locations.py); these remain only as pre-multi-location fallbacks for the web app.
 STATUS_JSON   = DATA_DIR / "status.json"
 DASHBOARD_HTML= DATA_DIR / "dashboard.html"
 TIPS_JSON     = DATA_DIR / "booking_tips.json"   # written by ai_concierge.sh (subscription)

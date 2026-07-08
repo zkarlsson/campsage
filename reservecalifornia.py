@@ -20,6 +20,13 @@ from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import config
+import locations
+from locations import haversine as _haversine
+
+# Search-center fallback when a call has no meaningful origin (the RDR API requires
+# Latitude/Longitude in every body, but PlaceId/FacilityId drive the actual query —
+# the center only affects the cosmetic MilesFromSelected). Geographic center of CA.
+_CA_CENTER = (36.7783, -119.4179)
 
 # The live API base (read from reservecalifornia.com's own config.json -> rdrApiUrl).
 RDR = "https://california-rdr.prod.cali.rd12.recreation-management.tylerapp.com/rdr"
@@ -73,9 +80,11 @@ def search_places(lat, lng, start_date):
     return (d or {}).get("NearbyPlaces", []) or []
 
 
-def facilities_for(place_id, start_date):
+def facilities_for(place_id, start_date, lat=None, lng=None):
+    if lat is None or lng is None:
+        lat, lng = _CA_CENTER
     d = _post("search/place", {
-        "PlaceId": place_id, "Latitude": config.HOME_LAT, "Longitude": config.HOME_LNG,
+        "PlaceId": place_id, "Latitude": lat, "Longitude": lng,
         "HighlightedPlaceId": place_id, "StartDate": start_date, "Nights": min(config.NIGHTS),
         "CountNearby": False, "NearbyLimit": 0, "Sort": "Distance", "CustomerId": "0",
         "RefreshFavourites": True, "IsADA": False, "UnitCategoryId": 1,
@@ -166,7 +175,8 @@ def _group_openings(blocks, cap=6):
 def analyze_place(place, win_start, win_end):
     pid = place.get("PlaceId")
     blocks, wk = [], []
-    for fid, fname in facilities_for(pid, win_start.isoformat()):
+    for fid, fname in facilities_for(pid, win_start.isoformat(),
+                                     place.get("Latitude"), place.get("Longitude")):
         units = free_dates_by_unit(fid, win_start, win_end)
         for uname, dates in units.items():
             label = f"{fname} · {uname}".strip(" ·")
@@ -207,36 +217,19 @@ def _card(place, state_beach=True):
     }
 
 
-def _haversine(lat1, lng1, lat2, lng2):
-    import math
-    R = 3958.8
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi, dl = math.radians(lat2 - lat1), math.radians(lng2 - lng1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def _nearest_anchor(lat, lng):
-    best = None
-    for label, alat, alng in config.REGION_ANCHORS:
-        d = _haversine(lat, lng, alat, alng)
-        if best is None or d < best[0]:
-            best = (d, label)
-    return best[1] if best else None
-
-
 def is_campable_place(name):
     """A general state-park camping place: reuse the beach veto (drops day-use / cottages /
     trailers / OHV-dune / lake-only / historic units) but DON'T require it to be a beach."""
     return not any(w in (name or "") for w in config.BEACH_VETO)
 
 
-def discover_state_parks(win_start, win_end, errors, log=lambda *_: None):
-    """General CA state-park campgrounds (non-beach) via ReserveCalifornia, searched from home
-    AND each region anchor (so far parks like Big Sur's are found), merged + deduped, ranked by
-    distance-from-LA. Returns cards (state_park=True, no ratings) with opening info."""
-    centers = [(config.HOME_LAT, config.HOME_LNG, None)]
-    centers += [(alat, alng, label) for label, alat, alng in config.REGION_ANCHORS]
+def discover_state_parks(loc, anchors, win_start, win_end, errors, log=lambda *_: None):
+    """General CA state-park campgrounds (non-beach) via ReserveCalifornia, searched from
+    the scan location AND each active region anchor (so far parks like Big Sur's are
+    found), merged + deduped, ranked by distance from the location. Returns cards
+    (state_park=True, no ratings) with opening info."""
+    centers = [(loc.lat, loc.lng, None)]
+    centers += [(alat, alng, label) for label, alat, alng in anchors]
     raw = {}
     for lat, lng, label in centers:
         try:
@@ -245,23 +238,29 @@ def discover_state_parks(win_start, win_end, errors, log=lambda *_: None):
                 nm = p.get("Name") or ""
                 if not pid or pid in raw:
                     continue
-                if is_beach_place(nm):                 # beaches handled by discover_beaches
-                    continue
                 if not is_campable_place(nm):
                     continue
                 raw[pid] = p
         except Exception as e:
             errors.append(f"stateparks search {label or 'home'}: {e}")
-        time.sleep(0.3)                                # be polite: ~15 searches
-    # Distance from LA + nearest region anchor (group for the per-region cap).
+        time.sleep(0.3)                                # be polite: ~20 searches
+    # Distance from the scan location + nearest active anchor (for the per-region cap).
     for p in raw.values():
         la, lo = p.get("Latitude"), p.get("Longitude")
         try:
-            p["_dist"] = _haversine(config.HOME_LAT, config.HOME_LNG, float(la), float(lo))
-            p["_region"] = _nearest_anchor(float(la), float(lo))
+            p["_dist"] = _haversine(loc.lat, loc.lng, float(la), float(lo))
+            p["_region"] = locations.nearest_anchor(float(la), float(lo), anchors)[0]
         except (TypeError, ValueError):
             p["_dist"] = float(p.get("MilesFromSelected") or 9e9)
             p["_region"] = None
+    # Beach-tagged places are normally the beach section's job (discover_beaches) — but
+    # that section only reaches BEACH_MAX_DISTANCE from home, so a far coastal park
+    # (Sue-meg from Oakland, Mackerricher from LA) would otherwise vanish entirely.
+    # Keep beaches AS state parks when they're beyond the beach section's reach.
+    for pid in [pid for pid, p in raw.items()
+                if is_beach_place(p.get("Name") or "")
+                and p["_dist"] <= config.BEACH_MAX_DISTANCE]:
+        del raw[pid]
     # Keep the nearest STATE_PARK_PER_ANCHOR per region (bounds availability calls), then a
     # global cap — closest first — so a far cluster can't blow the API budget.
     per = {}
@@ -287,7 +286,7 @@ def discover_state_parks(win_start, win_end, errors, log=lambda *_: None):
                 errors.append(f"statepark {p.get('Name')}: {e}")
                 continue
             card = _card(p, state_beach=False)
-            card["distance"] = round(p["_dist"], 1)           # distance from LA, not anchor
+            card["distance"] = round(p["_dist"], 1)           # distance from home, not anchor
             card["state_park"] = True
             card["everyday"] = p["_dist"] <= config.MAX_DISTANCE_MI
             card["destination"] = None if card["everyday"] else (p["_region"] or "State Park")
@@ -296,8 +295,8 @@ def discover_state_parks(win_start, win_end, errors, log=lambda *_: None):
     return out
 
 
-def discover_beaches(win_start, win_end, errors):
-    places = search_places(config.HOME_LAT, config.HOME_LNG, win_start.isoformat())
+def discover_beaches(loc, win_start, win_end, errors):
+    places = search_places(loc.lat, loc.lng, win_start.isoformat())
     cands = [p for p in places
              if is_beach_place(p.get("Name") or "")
              and float(p.get("MilesFromSelected") or 9e9) <= config.BEACH_MAX_DISTANCE]

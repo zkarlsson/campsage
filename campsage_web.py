@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 campsage_web.py — standalone web UI for CampSage. Serves the phone status page + the interactive
-map (Leaflet + OpenStreetMap, no API keys). Reads the scan output that camp_agent.py writes to
-DATA_DIR. Run:  python campsage_web.py   (then open http://localhost:5001/camp)
+map (Leaflet + OpenStreetMap, no API keys) for every saved location camp_agent.py has scanned
+(DATA_DIR/locations/<slug>/). Legacy pre-multi-location volumes (flat status.json/dashboard.html,
+no locations.json) keep working until the first new-style scan lands.
+Run:  python campsage_web.py   (then open http://localhost:5001/camp)
 """
 import json
 from pathlib import Path
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify, Response, redirect
 
 import config
 
@@ -24,10 +26,28 @@ def load_json_safe(path, default=None):
     return default if default is not None else {}
 
 
+def _index():
+    """locations.json, or None on a legacy (single flat scan) volume."""
+    return load_json_safe(DATA / "locations.json", None) or None
+
+
+def _known_slugs(idx):
+    return [e.get("slug") for e in (idx or {}).get("locations", []) if e.get("slug")]
+
+
+def _unknown(idx):
+    slugs = ", ".join(_known_slugs(idx)) or "(none scanned yet)"
+    return (f"<body style='font:16px sans-serif;padding:40px'>Unknown location. "
+            f"Known: {slugs}</body>", 404)
+
+
 @app.route("/")
 @app.route("/camp")
 def camp_page():
-    f = DATA / "dashboard.html"
+    idx = _index()
+    if idx:
+        return redirect(f"/camp/{idx.get('default') or _known_slugs(idx)[0]}")
+    f = DATA / "dashboard.html"                     # legacy flat volume
     if f.exists():
         return f.read_text()
     return ("<body style='font:16px sans-serif;padding:40px'>CampSage hasn't run yet \u2014 "
@@ -36,7 +56,33 @@ def camp_page():
 
 @app.route("/camp/data")
 def camp_data():
-    f = DATA / "status.json"
+    idx = _index()
+    if idx:
+        return redirect(f"/camp/{idx.get('default') or _known_slugs(idx)[0]}/data")
+    f = DATA / "status.json"                        # legacy flat volume
+    if f.exists():
+        return Response(f.read_text(), mimetype="application/json")
+    return jsonify({"status": "pending"}), 200
+
+
+@app.route("/camp/<slug>")
+def camp_page_loc(slug):
+    idx = _index()
+    if not idx or slug not in _known_slugs(idx):
+        return _unknown(idx)
+    f = DATA / "locations" / slug / "dashboard.html"
+    if f.exists():
+        return f.read_text()
+    return ("<body style='font:16px sans-serif;padding:40px'>This location hasn't been "
+            "scanned yet \u2014 the next cron run will populate it.</body>", 200)
+
+
+@app.route("/camp/<slug>/data")
+def camp_data_loc(slug):
+    idx = _index()
+    if not idx or slug not in _known_slugs(idx):
+        return _unknown(idx)
+    f = DATA / "locations" / slug / "status.json"
     if f.exists():
         return Response(f.read_text(), mimetype="application/json")
     return jsonify({"status": "pending"}), 200
@@ -44,8 +90,23 @@ def camp_data():
 
 @app.route("/camp/map")
 def camp_map():
+    idx = _index()
+    if idx:
+        return redirect(f"/camp/{idx.get('default') or _known_slugs(idx)[0]}/map")
+    return _render_map(load_json_safe(DATA / "status.json", {}))    # legacy flat volume
+
+
+@app.route("/camp/<slug>/map")
+def camp_map_loc(slug):
+    idx = _index()
+    if not idx or slug not in _known_slugs(idx):
+        return _unknown(idx)
+    return _render_map(load_json_safe(DATA / "locations" / slug / "status.json", {}),
+                       back=f"/camp/{slug}")
+
+
+def _render_map(status, back="/camp"):
     """Self-contained Leaflet map of every available campsite + beach (OSM tiles, no API keys)."""
-    status = load_json_safe(DATA / "status.json", {})
     wiki = load_json_safe(DATA / "wiki_images.json", {})
     pts = []
     for kind, arr in (("camp", status.get("results") or []), ("beach", status.get("beach") or [])):
@@ -74,8 +135,13 @@ def camp_map():
                 "url": s.get("book_url") or s.get("avail_url") or "",
             })
     home = status.get("home") or "home"
+    try:
+        center = [float(status["lat"]), float(status["lng"])]
+    except (KeyError, TypeError, ValueError):
+        center = [36.78, -119.42]                   # CA center (legacy status w/o lat/lng)
     return Response(_CAMP_MAP_HTML.replace("__DATA__", json.dumps(pts))
-                    .replace("__HOME__", str(home)).replace("__N__", str(len(pts))),
+                    .replace("__HOME__", str(home)).replace("__N__", str(len(pts)))
+                    .replace("__CENTER__", json.dumps(center)).replace("__BACK__", back),
                     mimetype="text/html")
 
 
@@ -108,7 +174,7 @@ _CAMP_MAP_HTML = """<!DOCTYPE html><html lang="en"><head>
     padding:8px 10px;border-radius:8px;font-size:12px;z-index:1000;line-height:1.7}
   .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
 </style></head><body>
-<div class="bar"><a href="/camp">← List</a><b>🏕️ CampSage Map</b><span class="muted" id="count">__N__ shown</span></div>
+<div class="bar"><a href="__BACK__">← List</a><b>🏕️ CampSage Map — __HOME__</b><span class="muted" id="count">__N__ shown</span></div>
 <div class="filters" id="filters">
   <span class="chip active" data-f="type" data-v="all">All</span>
   <span class="chip" data-f="type" data-v="camp">🏕️ Camp</span>
@@ -132,7 +198,7 @@ _CAMP_MAP_HTML = """<!DOCTYPE html><html lang="en"><head>
 </div>
 <script>
 const PTS = __DATA__;
-const map = L.map('map',{zoomControl:true}).setView([34.05,-118.24], 8);
+const map = L.map('map',{zoomControl:true}).setView(__CENTER__, 8);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
   {maxZoom:18, attribution:'© OpenStreetMap'}).addTo(map);
 const color = p => p.k==='beach' ? '#f0b429' : p.n3 ? '#2ec27e' : p.n2 ? '#4aa3ff' : '#8ba398';

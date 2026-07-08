@@ -2,16 +2,29 @@
 
 Finds great **California** campsites with **2–3 consecutive nights open at the same site**,
 ranked **closest-to-home first** among **well-reviewed** spots, and publishes a phone-friendly
-status page + an interactive map. Runs on any always-on box via cron. **No API keys.**
+status page + an interactive map — for **every saved location** (zip code or address) in
+`config.LOCATIONS`. Runs on any always-on box via cron or the included docker-compose stack.
+**No API keys** (geocoding included: Zippopotam for zips, Nominatim for addresses; results are
+cached forever in `geocode_cache.json`).
 
 ## Quick start
 ```bash
 pip install flask                 # the only dependency (scanner itself is stdlib-only)
-# 1. set your home location + search radius in config.py (HOME_LAT / HOME_LNG / ...)
-python3 camp_agent.py             # scan recreation.gov + ReserveCalifornia -> writes status.json
+# 1. set your locations in config.py:
+#    LOCATIONS = [{"name": "Oakland", "query": "94607"}, ...]   # zip or address;
+#    explicit "lat"/"lng" skip geocoding (escape hatch). DEFAULT_LOCATION picks the /camp tab.
+python3 camp_agent.py             # scan each location -> locations/<slug>/status.json + index
 python3 camp_wiki_images.py       # (optional) fetch beach/park photos from Wikimedia Commons
-python3 campsage_web.py           # serve it -> open http://localhost:5001/camp  (and /camp/map)
+python3 campsage_web.py           # serve it -> open http://localhost:5001/camp
 ```
+URLs: `/camp` redirects to the default location; each location lives at `/camp/<slug>`
+(`/camp/<slug>/map`, `/camp/<slug>/data`). The page header has a location-switcher pill row.
+Region tabs are statewide: only anchors within ~300 mi of a location are searched, so an
+Oakland scan gets Point Reyes/Tahoe/Big Sur tabs while an LA scan keeps Big Bear/Ojai/Joshua
+Tree — API load stays flat per location.
+
+Docker: `docker compose up -d --build` (web on :5055 host-side; scanner runs 7:00/13:00/18:00 PT
+via supercronic and scans all locations sequentially).
 Run `camp_agent.py` on a cron (e.g. a few times a day) to keep results fresh. Add the page to your
 phone's Home Screen. Every card has a green **Book on Recreation.gov →** button, a **See calendar**
 link, and **Directions**.

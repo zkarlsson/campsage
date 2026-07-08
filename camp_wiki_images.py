@@ -101,21 +101,36 @@ def _wiki_images(name):
     return []
 
 
+def _status_files():
+    """Every scanned location's status.json (multi-location), else the legacy flat one."""
+    import locations
+    idx = locations.read_index()
+    if idx:
+        files = [config.DATA_DIR / "locations" / e["slug"] / "status.json"
+                 for e in idx.get("locations", []) if e.get("slug")]
+        return [f for f in files if f.exists()]
+    return [STATUS] if STATUS.exists() else []
+
+
 def run():
-    if not STATUS.exists():
+    files = _status_files()
+    if not files:
         print("no status.json yet"); return 1
-    d = json.loads(STATUS.read_text())
     cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
     # migrate any old string-format entries to lists
     cache = {k: ([v] if isinstance(v, str) and v else (v if isinstance(v, list) else []))
              for k, v in cache.items()}
 
+    # Union of names across all locations — the cache is keyed by name, so a park
+    # reachable from two locations is fetched once.
     targets = []
-    for arr in (d.get("beach") or [], d.get("results") or []):
-        for s in arr:
-            img = s.get("image") or ""
-            if (not img) or ("cali-content" in img):
-                targets.append(s.get("name", ""))
+    for f in files:
+        d = json.loads(f.read_text())
+        for arr in (d.get("beach") or [], d.get("results") or []):
+            for s in arr:
+                img = s.get("image") or ""
+                if (not img) or ("cali-content" in img):
+                    targets.append(s.get("name", ""))
     targets = [t for t in dict.fromkeys(targets) if t and t not in cache]
 
     added = 0

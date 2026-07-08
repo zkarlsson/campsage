@@ -11,7 +11,6 @@ Data source: recreation.gov public JSON endpoints (no API key):
 Pure standard library. Run:  python3 camp_agent.py
 """
 import json
-import math
 import re
 import sys
 import time
@@ -29,6 +28,8 @@ except Exception:                       # pragma: no cover
     PT = None
 
 import config
+import locations
+from locations import haversine as _haversine
 
 SEARCH_URL = "https://www.recreation.gov/api/search"
 AVAIL_URL  = "https://www.recreation.gov/api/camps/availability/campground/{cid}/month"
@@ -39,12 +40,38 @@ AVAIL_PAGE = "https://www.recreation.gov/camping/campgrounds/{cid}/availability"
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP
 # ──────────────────────────────────────────────────────────────────────────────
+# Global request pacing: the statewide anchor expansion multiplied availability
+# fetches, and recreation.gov throttles on a CUMULATIVE trailing window, not just
+# bursts (observed 2026-07-07: ~650 calls at 5.5 req/s for one city filled the quota
+# and the next city's first minutes 429'd — twice, same campgrounds). 1 req/s across
+# all worker threads keeps a two-city scan (~1100 calls) safely under it; the cron
+# runs 3×/day so a ~20-minute scan costs nothing. 429s additionally back off long
+# enough to outlive a throttle window instead of burning the retry budget in seconds.
+_PACE_LOCK = None
+_PACE_LAST = [0.0]
+MIN_REQUEST_SPACING_S = 1.0
+RATE_LIMIT_RETRIES = 5
+
+
+def _pace():
+    global _PACE_LOCK
+    if _PACE_LOCK is None:
+        import threading
+        _PACE_LOCK = threading.Lock()
+    with _PACE_LOCK:
+        wait = _PACE_LAST[0] + MIN_REQUEST_SPACING_S - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _PACE_LAST[0] = time.monotonic()
+
+
 def http_get_json(url, params=None):
-    """GET JSON with a browser UA, timeout, and backoff on 429/5xx."""
+    """GET JSON with a browser UA, timeout, global pacing, and backoff on 429/5xx."""
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
     last_err = None
-    for attempt in range(config.RETRIES):
+    for attempt in range(max(config.RETRIES, RATE_LIMIT_RETRIES)):
+        _pace()
         try:
             req = urllib.request.Request(url, headers={
                 "User-Agent": config.USER_AGENT,
@@ -54,14 +81,28 @@ def http_get_json(url, params=None):
                 return json.loads(r.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as e:
             last_err = e
-            if e.code in (429, 500, 502, 503, 504):
+            if e.code == 429:                       # throttled: wait the window out
+                retry_after = 0
+                try:
+                    retry_after = int(e.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    pass
+                time.sleep(max(retry_after, min(10.0 * (attempt + 1), 45)))
+                continue
+            if e.code in (500, 502, 503, 504):
+                if attempt >= config.RETRIES - 1:
+                    break
                 time.sleep(1.5 * (attempt + 1))
                 continue
             if e.code == 404:
                 return None
+            if attempt >= config.RETRIES - 1:
+                break
             time.sleep(0.8 * (attempt + 1))
         except Exception as e:
             last_err = e
+            if attempt >= config.RETRIES - 1:
+                break
             time.sleep(0.8 * (attempt + 1))
     raise RuntimeError(f"GET failed {url}: {last_err}")
 
@@ -69,12 +110,11 @@ def http_get_json(url, params=None):
 # ──────────────────────────────────────────────────────────────────────────────
 # Step 1 — discover well-reviewed campgrounds near home
 # ──────────────────────────────────────────────────────────────────────────────
-def search_campgrounds(lat=None, lng=None, radius=None):
+def search_campgrounds(lat, lng, radius=None):
     """Recreation.gov campground search centered on (lat,lng) within `radius` miles.
-    Defaults to the LA home base; pass a region anchor to find far destinations the
-    LA-centered search (capped at 150 score-ranked results) never returns."""
-    lat = config.HOME_LAT if lat is None else lat
-    lng = config.HOME_LNG if lng is None else lng
+    Called once from the scan location and once per active region anchor (the
+    home-centered search is capped at 150 score-ranked results, so far destinations
+    only surface via their anchor)."""
     radius = config.SEARCH_RADIUS_MI if radius is None else radius
     found, start = [], 0
     while True:
@@ -99,18 +139,19 @@ def search_campgrounds(lat=None, lng=None, radius=None):
     return found
 
 
-def discover():
-    """LA-centered search PLUS a small search around every region anchor, merged and
-    deduped by campground id. Distance is recomputed from LA (the API's `distance` is
-    relative to whatever center we searched), and far destination finds are tagged so the
-    page can keep the All tab close to home while still surfacing them under their tab."""
+def discover(loc, anchors):
+    """Location-centered search PLUS a small search around every ACTIVE region anchor
+    (the subset within reach of `loc`), merged and deduped by campground id. Distance is
+    recomputed from `loc` (the API's `distance` is relative to whatever center we
+    searched), and far destination finds are tagged so the page can keep the All tab
+    close to home while still surfacing them under their tab."""
     raw = {}
-    for c in search_campgrounds():                       # everyday LA search
+    for c in search_campgrounds(loc.lat, loc.lng):       # everyday home search
         cid = c.get("entity_id")
         if cid:
             raw[cid] = c
     if config.ANCHOR_SEARCH_ENABLED:
-        for label, alat, alng in config.REGION_ANCHORS:
+        for label, alat, alng in anchors:
             try:
                 for c in search_campgrounds(alat, alng, config.REGION_SEARCH_RADIUS_MI):
                     cid = c.get("entity_id")
@@ -119,28 +160,29 @@ def discover():
                         raw[cid] = c
             except Exception as e:
                 log(f"  anchor search '{label}' failed: {e}")
-            time.sleep(0.3)                              # be polite: 15 searches/run now
-    # Explicitly seed the iconic FAR campgrounds that the score-ranked anchor search can miss
-    # (e.g. Kirk Creek) via a targeted name query, so the ⭐ Sought-after tab is reliable.
-    for q in ("Kirk Creek", "Plaskett Creek", "Limekiln", "Julia Pfeiffer Burns", "Andrew Molera"):
-        try:
-            data = http_get_json(SEARCH_URL, {"q": q, "fq": "entity_type:campground", "size": 5})
-            for c in (data or {}).get("results", []) or []:
-                cid = c.get("entity_id")
-                if cid and cid not in raw and q.split()[0].lower() in (c.get("name") or "").lower():
-                    c["_destination"] = c.get("_destination") or "Big Sur"
-                    raw[cid] = c
-            time.sleep(0.3)
-        except Exception as e:
-            log(f"  marquee seed '{q}' failed: {e}")
-    # Recompute distance from HOME for consistent ranking (anchor results carry a
-    # distance measured from the anchor, not from LA).
+            time.sleep(0.3)                              # be polite: ~20 searches/run
+    # Explicitly seed the iconic FAR campgrounds that the score-ranked anchor search can
+    # miss (e.g. Kirk Creek) via a targeted name query, so the ⭐ Sought-after tab is
+    # reliable. Only meaningful when Big Sur is in reach of this location.
+    if any(label == "Big Sur" for label, _, _ in anchors):
+        for q in ("Kirk Creek", "Plaskett Creek", "Limekiln", "Julia Pfeiffer Burns", "Andrew Molera"):
+            try:
+                data = http_get_json(SEARCH_URL, {"q": q, "fq": "entity_type:campground", "size": 5})
+                for c in (data or {}).get("results", []) or []:
+                    cid = c.get("entity_id")
+                    if cid and cid not in raw and q.split()[0].lower() in (c.get("name") or "").lower():
+                        c["_destination"] = c.get("_destination") or "Big Sur"
+                        raw[cid] = c
+                time.sleep(0.3)
+            except Exception as e:
+                log(f"  marquee seed '{q}' failed: {e}")
+    # Recompute distance from the scan location for consistent ranking (anchor results
+    # carry a distance measured from the anchor, not from home).
     for c in raw.values():
         lat, lng = c.get("latitude"), c.get("longitude")
         if lat is not None and lng is not None:
             try:
-                c["distance"] = _haversine(config.HOME_LAT, config.HOME_LNG,
-                                           float(lat), float(lng))
+                c["distance"] = _haversine(loc.lat, loc.lng, float(lat), float(lng))
             except (TypeError, ValueError):
                 pass
     return list(raw.values())
@@ -192,11 +234,32 @@ def months_to_fetch(today, window_days):
     return months
 
 
+# Per-process availability memo: campgrounds reachable from more than one scan
+# location (Big Sur, Pismo from both LA and Oakland) are fetched once per run.
+_AVAIL_MEMO = {}
+_AVAIL_LOCK = None  # created lazily; ThreadPoolExecutor workers share the dict
+
+
+def _fetch_month(cid, mstart):
+    global _AVAIL_LOCK
+    if _AVAIL_LOCK is None:
+        import threading
+        _AVAIL_LOCK = threading.Lock()
+    key = (cid, mstart)
+    with _AVAIL_LOCK:
+        if key in _AVAIL_MEMO:
+            return _AVAIL_MEMO[key]
+    data = http_get_json(AVAIL_URL.format(cid=cid), {"start_date": mstart})
+    with _AVAIL_LOCK:
+        _AVAIL_MEMO[key] = data
+    return data
+
+
 def fetch_availability(cid, months):
     """Merge the month payloads into {site_id: {meta, dates:{date->status}}}."""
     sites = {}
     for mstart in months:
-        data = http_get_json(AVAIL_URL.format(cid=cid), {"start_date": mstart})
+        data = _fetch_month(cid, mstart)
         for sid, c in ((data or {}).get("campsites", {}) or {}).items():
             entry = sites.setdefault(sid, {
                 "site": c.get("site"), "loop": c.get("loop"),
@@ -316,29 +379,14 @@ def now_pt():
     return dt.strftime("%a %b %-d, %-I:%M %p %Z").strip()
 
 
-def _haversine(lat1, lng1, lat2, lng2):
-    R = 3958.8
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi, dl = math.radians(lat2 - lat1), math.radians(lng2 - lng1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def _slug(s):
-    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
-
-
-def assign_region(card):
-    """Tag a campground with the NEAREST destination anchor (Big Bear, etc.)."""
+def assign_region(card, anchors):
+    """Tag a campground with the NEAREST active destination anchor (Big Bear, etc.).
+    Only the location's active anchor subset participates, so tabs match what was
+    actually searched."""
     lat, lng = card.get("lat"), card.get("lng")
     if lat is None or lng is None:
         return "Other", "other"
-    best = None
-    for label, alat, alng in config.REGION_ANCHORS:
-        d = _haversine(float(lat), float(lng), alat, alng)
-        if best is None or d < best[0]:
-            best = (d, label)
-    return best[1], _slug(best[1])
+    return locations.nearest_anchor(float(lat), float(lng), anchors)
 
 
 def _base(c):
@@ -361,10 +409,101 @@ def _base(c):
     }
 
 
-def analyze_candidates(candidates, months, win_start, win_end, errors):
-    """Fetch availability for each candidate in parallel; return a list of card dicts
-    (base info merged with opening info). Items without openings keep openings=[]."""
-    out = []
+# ⭐ Most sought-after: the bucket-list campgrounds people fight over. Built from ALL analyzed
+# places (INCLUDING full ones) so they ALWAYS show on their own tab — a cancellation is one tap away.
+# Evidence-based "most sought-after" set — validated + expanded by a multi-agent web study
+# (2026-07-01) across The Dyrt / Campendium / Hipcamp / Sunset / Campnab most-watched + the
+# ReserveCalifornia "hardest to book" reporting. Big-4 LA consensus: Kirk Creek, Pfeiffer,
+# Crystal Cove, Leo Carrillo. Statewide entries added 2026-07-07 with multi-location
+# support (deeper NorCal curation is a follow-up — only famous names here).
+MARQUEE_KW = ["kirk creek", "plaskett", "pfeiffer", "limekiln", "julia pfeiffer", "andrew molera",
+              "leo carrillo", "crystal cove", "el capitan", "refugio", "carpinteria", "doheny",
+              "san onofre", "san elijo", "carlsbad", "bolsa chica", "silver strand", "point mugu",
+              "sycamore", "malibu creek", "thornhill", "jalama", "montana de oro", "morro bay",
+              "pismo", "wheeler gorge", "gaviota", "sunset state", "new brighton", "seacliff",
+              # added from the study (LA-reachable, discoverable via existing anchors):
+              "serrano", "idyllwild", "palomar", "doane valley", "san clemente",
+              # DESERT (now discoverable via the new Joshua Tree / Anza-Borrego anchors):
+              "jumbo rocks", "indian cove", "black rock", "white tank", "ryan campground",
+              "borrego palm",
+              # NORCAL (discoverable via the statewide anchors; famous-only):
+              "steep ravine", "emerald bay", "bliss", "mackerricher", "salt point",
+              "van damme", "upper pines", "lower pines", "north pines", "tuolumne meadows"]
+# Coveted-SITE intel from the 2026-07-01 study — the specific sites people fight for, so an
+# opening isn't just "a site" but "the good site vs an interior dud". Keys matched in the name;
+# longest (most specific) key wins so "pfeiffer big sur" and "julia pfeiffer" don't collide.
+MARQUEE_SITES = {
+    "kirk creek": "bluff sites right over the ocean — 9, 11, 15, 17, 19, 21, 22",
+    "plaskett": "24–30 most spacious · 41–43 best ocean views · 12–17 nearest the beach",
+    "pfeiffer big sur": "riverfront + big wooded even-numbered sites 6–36; 116 by the gorge",
+    "julia pfeiffer": "only 2 walk-in sites — EC1 'Saddle Rock' is closest to the ocean",
+    "el capitan": "blufftop 91–130 — favorites 101, 104, 109",
+    "refugio": "beachfront 24–26, 29–35, 60, 61 · 52 for shade",
+    "carpinteria": "oceanfront 103–115 (Santa Rosa loop) · quiet 140–155",
+    "san elijo": "ocean-view bluff row 145–171 (also 1–43); interior sites hear the train",
+    "carlsbad": "premium west-facing blufftop sites (stairs down to the sand)",
+    "leo carrillo": "site 139 is the pick; tree-shaded canyon",
+    "silver strand": "oceanfront 101–137 (RV / self-contained only)",
+    "doheny": "beachfront sites 37–94",
+    "san onofre": "Bluffs ocean-view 1–23, 99–119, 146–174; San Mateo 1–67 near Trestles",
+    "san clemente": "Tent West 73–99 (esp. 82) for sunset ocean views",
+    "thornhill": "primitive sites literally on the sand",
+    "sycamore": "shady canyon sites, a short walk to the cove",
+    "point mugu": "Thornhill Broome sites are right on the beach",
+    "serrano": "lakeside sites 112–118",
+    "limekiln": "ocean-facing sites 1 & 2 are the largest",
+    "jalama": "beachfront 63 & 64 on Abalone Point",
+    "crystal cove": "the blufftop row over the open coast",
+    "morro bay": "select bayfront sites via the monthly reservation Draw (lottery)",
+    "andrew molera": "walk-in meadow — sites 4, 20, 22 for shade",
+    "montana de oro": "big private bluff sites (Islay Creek)",
+    "jumbo rocks": "sites tucked among the giant boulders; superb dark-sky stargazing",
+    "indian cove": "sites nestled behind the rock formations (climbers' favorite)",
+    "black rock": "quieter, tree-shaded high-desert sites; good basecamp",
+    "steep ravine": "the 7 rustic cabins over the ocean are the most coveted booking in the state system",
+}
+_MSORT = sorted(MARQUEE_SITES.items(), key=lambda x: -len(x[0]))   # longest key wins
+
+
+def is_marquee_name(name):
+    nm = (name or "").lower()
+    return any(kw in nm for kw in MARQUEE_KW)
+
+
+def cap_destination_candidates(candidates, anchors, log=lambda *_: None):
+    """Bound availability fetches: the page shows at most REGION_MAX_PER_TAB spots per
+    far region, so analyzing every anchor-search find is wasted API budget (and got the
+    IP 429-throttled when the statewide anchors landed). Keep all everyday candidates,
+    but per far region keep only the credibility-weighted best (rating × log10 reviews)
+    few beyond the display cap — plus every marquee-name candidate, which the
+    ⭐ Sought-after tab needs regardless of rank."""
+    import math
+    everyday = [c for c in candidates if not c.get("_destination")]
+    dest = [c for c in candidates if c.get("_destination")]
+    per_cap = config.REGION_MAX_PER_TAB + 4          # spare for full/no-opening spots
+    by_region = {}
+    for c in dest:
+        try:
+            slug = locations.nearest_anchor(float(c.get("latitude")),
+                                            float(c.get("longitude")), anchors)[1]
+        except (TypeError, ValueError):
+            slug = "other"
+        by_region.setdefault(slug, []).append(c)
+    kept = list(everyday)
+    for slug, group in by_region.items():
+        group.sort(key=lambda c: -(float(c.get("average_rating") or 0)
+                                   * math.log10(int(c.get("number_of_ratings") or 0) + 1)))
+        keep = group[:per_cap] + [c for c in group[per_cap:] if is_marquee_name(c.get("name"))]
+        kept.extend(keep)
+    if len(kept) < len(candidates):
+        log(f"  capped availability fetches: {len(candidates)} candidates -> {len(kept)} "
+            f"(top {per_cap}/far region + marquee)")
+    return kept
+
+
+def _analyze_pass(candidates, months, win_start, win_end):
+    """One parallel availability pass. Returns (cards, [(candidate, error), ...])."""
+    out, failed = [], []
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as ex:
         futs = {ex.submit(analyze_campground, c, months, win_start, win_end): c
                 for c in candidates}
@@ -373,25 +512,45 @@ def analyze_candidates(candidates, months, win_start, win_end, errors):
             try:
                 res = fut.result()
             except Exception as e:
-                errors.append(f"{c.get('name')}: {e}")
+                failed.append((c, str(e)))
                 continue
             if res.get("error"):
-                errors.append(f"{c.get('name')}: {res['error']}")
+                failed.append((c, res["error"]))
                 continue
             out.append({**_base(c), **res})
+    return out, failed
+
+
+def analyze_candidates(candidates, months, win_start, win_end, errors, retry_wait=300):
+    """Fetch availability for each candidate in parallel; return a list of card dicts
+    (base info merged with opening info). Items without openings keep openings=[].
+    recreation.gov enforces an opaque rolling per-IP quota that a big scan can brush
+    against even fully paced — so candidates that fail get ONE second-chance pass after
+    the quota window slides. The availability memo makes retries cheap (already-fetched
+    months are served from memory); only both-pass failures are reported as errors."""
+    out, failed = _analyze_pass(candidates, months, win_start, win_end)
+    if failed and retry_wait:
+        log(f"  {len(failed)} availability fetches failed — retrying after "
+            f"{retry_wait // 60} min quota-window pause…")
+        time.sleep(retry_wait)
+        more, failed = _analyze_pass([c for c, _ in failed], months, win_start, win_end)
+        out += more
+    for c, err in failed:
+        errors.append(f"{c.get('name')}: {err}")
     return out
 
 
-def run():
+def run(loc, all_locs=None):
     today = date.today()
     win_start, win_end = today, today + timedelta(days=config.WINDOW_DAYS)
     months = months_to_fetch(today, config.WINDOW_DAYS)
     errors = []
+    anchors = locations.active_anchors(loc)
 
-    log(f"discovering campgrounds within {config.SEARCH_RADIUS_MI}mi of {config.HOME_NAME} "
-        f"+ {len(config.REGION_ANCHORS)} destination anchors…")
+    log(f"discovering campgrounds within {config.SEARCH_RADIUS_MI}mi of {loc.name} "
+        f"+ {len(anchors)} destination anchors in range…")
     try:
-        raw = discover()
+        raw = discover(loc, anchors)
     except Exception as e:
         log(f"FATAL search failed: {e}")
         raise
@@ -399,6 +558,7 @@ def run():
     ndest = sum(1 for c in candidates if c.get("_destination"))
     log(f"  {len(raw)} campgrounds found, {len(candidates)} pass reviews+distance filter "
         f"({ndest} far-destination finds)")
+    candidates = cap_destination_candidates(candidates, anchors, log)
 
     # Fetch availability in parallel.
     analyzed = analyze_candidates(candidates, months, win_start, win_end, errors)
@@ -415,7 +575,7 @@ def run():
             f"{config.BEACH_MAX_DISTANCE}mi…")
         try:
             import reservecalifornia
-            beach = reservecalifornia.discover_beaches(win_start, win_end, errors)
+            beach = reservecalifornia.discover_beaches(loc, win_start, win_end, errors)
             log(f"  {len(beach)} state-beach campgrounds, "
                 f"{sum(1 for b in beach if b.get('openings'))} with 2-3 night openings")
         except Exception as e:
@@ -428,7 +588,8 @@ def run():
     if config.STATE_PARKS_ENABLED:
         try:
             import reservecalifornia
-            parks = reservecalifornia.discover_state_parks(win_start, win_end, errors, log)
+            parks = reservecalifornia.discover_state_parks(loc, anchors, win_start, win_end,
+                                                           errors, log)
             park_hits = [p for p in parks if p.get("openings")]
             # Booked-out state parks (Pfeiffer Big Sur, etc.) still surface in the
             # great-but-full / set-alert list so a cancellation is one tap away.
@@ -448,7 +609,7 @@ def run():
     for h in hits:                                        # already distance-sorted
         if h.get("everyday"):
             continue
-        slug = assign_region(h)[1]
+        slug = assign_region(h, anchors)[1]
         if dest_per.get(slug, 0) >= config.REGION_MAX_PER_TAB:
             continue
         dest_per[slug] = dest_per.get(slug, 0) + 1
@@ -457,55 +618,6 @@ def run():
     if dest_hits:
         log(f"  + {len(dest_hits)} far-destination openings "
             f"({', '.join(sorted({h.get('destination') for h in dest_hits if h.get('destination')}))})")
-    # ⭐ Most sought-after: the bucket-list campgrounds people fight over. Built from ALL analyzed
-    # places (INCLUDING full ones) so they ALWAYS show on their own tab — a cancellation is one tap away.
-    # Evidence-based "most sought-after" set — validated + expanded by a multi-agent web study
-    # (2026-07-01) across The Dyrt / Campendium / Hipcamp / Sunset / Campnab most-watched + the
-    # ReserveCalifornia "hardest to book" reporting. LA-reachable; NorCal (redwoods/Lassen/Tahoe)
-    # omitted as out-of-range. Big-4 LA consensus: Kirk Creek, Pfeiffer, Crystal Cove, Leo Carrillo.
-    MARQUEE_KW = ["kirk creek", "plaskett", "pfeiffer", "limekiln", "julia pfeiffer", "andrew molera",
-                  "leo carrillo", "crystal cove", "el capitan", "refugio", "carpinteria", "doheny",
-                  "san onofre", "san elijo", "carlsbad", "bolsa chica", "silver strand", "point mugu",
-                  "sycamore", "malibu creek", "thornhill", "jalama", "montana de oro", "morro bay",
-                  "pismo", "wheeler gorge", "gaviota", "sunset state", "new brighton", "seacliff",
-                  # added from the study (LA-reachable, discoverable via existing anchors):
-                  "serrano", "idyllwild", "palomar", "doane valley", "san clemente",
-                  # DESERT (now discoverable via the new Joshua Tree / Anza-Borrego anchors):
-                  "jumbo rocks", "indian cove", "black rock", "white tank", "ryan campground",
-                  "borrego palm"]
-    # Coveted-SITE intel from the 2026-07-01 study — the specific sites people fight for, so an
-    # opening isn't just "a site" but "the good site vs an interior dud". Keys matched in the name;
-    # longest (most specific) key wins so "pfeiffer big sur" and "julia pfeiffer" don't collide.
-    MARQUEE_SITES = {
-        "kirk creek": "bluff sites right over the ocean — 9, 11, 15, 17, 19, 21, 22",
-        "plaskett": "24–30 most spacious · 41–43 best ocean views · 12–17 nearest the beach",
-        "pfeiffer big sur": "riverfront + big wooded even-numbered sites 6–36; 116 by the gorge",
-        "julia pfeiffer": "only 2 walk-in sites — EC1 'Saddle Rock' is closest to the ocean",
-        "el capitan": "blufftop 91–130 — favorites 101, 104, 109",
-        "refugio": "beachfront 24–26, 29–35, 60, 61 · 52 for shade",
-        "carpinteria": "oceanfront 103–115 (Santa Rosa loop) · quiet 140–155",
-        "san elijo": "ocean-view bluff row 145–171 (also 1–43); interior sites hear the train",
-        "carlsbad": "premium west-facing blufftop sites (stairs down to the sand)",
-        "leo carrillo": "site 139 is the pick; tree-shaded canyon",
-        "silver strand": "oceanfront 101–137 (RV / self-contained only)",
-        "doheny": "beachfront sites 37–94",
-        "san onofre": "Bluffs ocean-view 1–23, 99–119, 146–174; San Mateo 1–67 near Trestles",
-        "san clemente": "Tent West 73–99 (esp. 82) for sunset ocean views",
-        "thornhill": "primitive sites literally on the sand",
-        "sycamore": "shady canyon sites, a short walk to the cove",
-        "point mugu": "Thornhill Broome sites are right on the beach",
-        "serrano": "lakeside sites 112–118",
-        "limekiln": "ocean-facing sites 1 & 2 are the largest",
-        "jalama": "beachfront 63 & 64 on Abalone Point",
-        "crystal cove": "the blufftop row over the open coast",
-        "morro bay": "select bayfront sites via the monthly reservation Draw (lottery)",
-        "andrew molera": "walk-in meadow — sites 4, 20, 22 for shade",
-        "montana de oro": "big private bluff sites (Islay Creek)",
-        "jumbo rocks": "sites tucked among the giant boulders; superb dark-sky stargazing",
-        "indian cove": "sites nestled behind the rock formations (climbers' favorite)",
-        "black rock": "quieter, tree-shaded high-desert sites; good basecamp",
-    }
-    _MSORT = sorted(MARQUEE_SITES.items(), key=lambda x: -len(x[0]))   # longest key wins
     beach_all = list(beach)                                 # capture BEFORE the openings filter
     if getattr(config, "SHOW_ONLY_OPENINGS", True):
         beach = [b for b in beach if b.get("openings")]
@@ -534,7 +646,7 @@ def run():
     # Tag each displayed campground with its destination region (for the place tabs).
     region_acc = {}
     for c in display:
-        label, slug = assign_region(c)
+        label, slug = assign_region(c, anchors)
         c["region"], c["region_slug"] = label, slug
         if c.get("openings"):                     # region tabs count only bookable spots (not full marquee)
             acc = region_acc.setdefault(slug, [label, 0, 9e9])
@@ -548,7 +660,10 @@ def run():
     status = {
         "generated_at": now_pt(),
         "generated_epoch": int(time.time()),
-        "home": config.HOME_NAME,
+        "home": loc.name,
+        "slug": loc.slug,
+        "lat": loc.lat,
+        "lng": loc.lng,
         "window_days": config.WINDOW_DAYS,
         "nights": config.NIGHTS,
         "max_distance": config.MAX_DISTANCE_MI,
@@ -568,11 +683,11 @@ def run():
         "marquee_count": len(marquee),
         "marquee_open": sum(1 for m in marquee if m.get("openings")),
         "regions": regions,
-        "errors": errors[:10],
+        "errors": errors[:40],
     }
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    config.STATUS_JSON.write_text(json.dumps(status, indent=2))
-    render_html(status)
+    loc.dir.mkdir(parents=True, exist_ok=True)
+    loc.status_json.write_text(json.dumps(status, indent=2))
+    render_html(status, loc, all_locs)
     log(f"DONE — {len(hits)} campgrounds with {min(config.NIGHTS)}-{max(config.NIGHTS)} "
         f"night openings, {len(no_opening)} great-but-full, {len(beach)} beach/coastal, "
         f"{len(errors)} errors")
@@ -589,7 +704,15 @@ def load_tips():
         return None
 
 
-def render_html(status):
+def render_html(status, loc=None, all_locs=None):
+    """Render a location's dashboard. `loc` defaults to a Location built from the
+    status itself (doctor.py re-renders from a bare status dict); `all_locs` drives
+    the location-switcher pills and may be None for a single-location setup."""
+    if loc is None:
+        loc = locations.Location(name=status.get("home", "Home"),
+                                 slug=status.get("slug") or locations.slugify(status.get("home", "home")),
+                                 lat=status.get("lat") or 0.0, lng=status.get("lng") or 0.0)
+
     def esc(s): return html.escape(str(s), quote=True)
 
     def card_html(h):
@@ -786,6 +909,17 @@ def render_html(status):
                  "recreation.gov · 📺 “social buzz” = YouTube popularity, not a satisfaction "
                  "rating · island camping excluded.</div>")
 
+    # Location switcher: one pill per saved scan origin, baked in at render time.
+    # (A location added to config shows up here after the next scan re-renders — noted,
+    # self-heals on the following cron tick.)
+    switcher_html = ""
+    if all_locs and len(all_locs) > 1:
+        pills = "".join(
+            f"<a class='locpill{' on' if l.slug == loc.slug else ''}' "
+            f"href='/camp/{esc(l.slug)}'>📍 {esc(l.name)}</a>"
+            for l in all_locs)
+        switcher_html = f"<div class='locs'>{pills}</div>"
+
     page = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -810,6 +944,12 @@ def render_html(status):
   .tabsep {{ flex:0 0 auto; width:1px; background:#2d4a3b; margin:4px 2px; }}
   .tabs button.wk {{ border-color:#4a3f7a; background:#221d3a; color:#c9b8ff; }}
   .tabs button.wk.on {{ background:#5a3fb0; color:#fff; border-color:#7a5fd0; }}
+  .locs {{ display:flex; gap:8px; margin-top:8px; overflow-x:auto; white-space:nowrap;
+    -webkit-overflow-scrolling:touch; scrollbar-width:none; }}
+  .locs::-webkit-scrollbar {{ display:none; }}
+  .locpill {{ flex:0 0 auto; padding:6px 12px; border:1px solid #2d4a3b; background:#16271f;
+    color:#cfe9da; border-radius:20px; font-size:13px; font-weight:600; text-decoration:none; }}
+  .locpill.on {{ background:#1f8a4c; color:#fff; border-color:#1f8a4c; }}
   .ct {{ display:inline-block; background:#ffffff2e; border-radius:20px;
     padding:0 7px; font-size:12px; margin-left:3px; }}
   .regionchip {{ display:inline-block; background:#23323f; color:#9fcdf0; font-size:11px;
@@ -880,8 +1020,9 @@ def render_html(status):
 </style></head>
 <body>
 <header>
-  <h1>🏕️ CampSage <a href="/camp/map" style="font-size:14px;font-weight:600;color:#7fd1a8;text-decoration:none;vertical-align:middle;margin-left:6px;padding:3px 10px;border:1px solid #2e7d5b;border-radius:16px">🗺️ Map</a></h1>
-  <div class="sub">Great California campsites · 2–3 nights at one spot · closest to {esc(status['home'])}</div>
+  <h1>🏕️ CampSage <a href="/camp/{esc(loc.slug)}/map" style="font-size:14px;font-weight:600;color:#7fd1a8;text-decoration:none;vertical-align:middle;margin-left:6px;padding:3px 10px;border:1px solid #2e7d5b;border-radius:16px">🗺️ Map</a></h1>
+  <div class="sub">Great California campsites · 2–3 nights at one spot · closest first</div>
+  {switcher_html}
   <div class="stamp">Updated {esc(status['generated_at'])} · {esc(cnt_line)}</div>
   {err_line}
   {health_banner}
@@ -950,12 +1091,17 @@ function srt(btn){{
 }}
 </script>
 </body></html>"""
-    config.DASHBOARD_HTML.write_text(page)
+    loc.dir.mkdir(parents=True, exist_ok=True)
+    loc.dashboard_html.write_text(page)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+LOG_PREFIX = ""     # set to "[<slug>] " during a location's scan
+
+
 def log(msg):
-    line = f"[{datetime.now(PT).strftime('%Y-%m-%d %H:%M:%S') if PT else datetime.now()}] {msg}"
+    stamp = datetime.now(PT).strftime('%Y-%m-%d %H:%M:%S') if PT else datetime.now()
+    line = f"[{stamp}] {LOG_PREFIX}{msg}"
     print(line, flush=True)
     try:
         config.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -965,5 +1111,21 @@ def log(msg):
         pass
 
 
+def main():
+    global LOG_PREFIX
+    locs = locations.load_locations()      # geocodes up front; exits loudly on failure
+    only = sys.argv[sys.argv.index("--location") + 1] if "--location" in sys.argv else None
+    todo = [l for l in locs if l.slug == only] if only else locs
+    if only and not todo:
+        sys.exit(f"unknown location {only!r}; configured: {', '.join(l.slug for l in locs)}")
+    for i, loc in enumerate(todo):
+        if i:
+            time.sleep(120)                # let the API's trailing quota window slide
+        LOG_PREFIX = f"[{loc.slug}] " if len(locs) > 1 else ""
+        status = run(loc, locs)
+        locations.update_index(loc, status, locs)   # index valid after EVERY location
+    LOG_PREFIX = ""
+
+
 if __name__ == "__main__":
-    run()
+    main()

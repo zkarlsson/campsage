@@ -18,11 +18,12 @@ from datetime import datetime
 
 import config
 import camp_agent
+import locations
 
 PT = camp_agent.PT
 
 
-def _checks(s):
+def _checks(s, page_url="http://127.0.0.1:5001/camp"):
     """Return list of (name, ok, severity, detail). severity: CRIT | WARN."""
     out = []
     now = time.time()
@@ -45,10 +46,10 @@ def _checks(s):
         out.append(("social_ok", False, "WARN", "social cache missing/unreadable"))
     # dashboard serving?
     try:
-        body = urllib.request.urlopen("http://127.0.0.1:5001/camp", timeout=10).read().decode()
-        out.append(("dashboard_ok", "CampSage" in body, "CRIT", "/camp serves on :5001"))
+        body = urllib.request.urlopen(page_url, timeout=10).read().decode()
+        out.append(("dashboard_ok", "CampSage" in body, "CRIT", f"{page_url} serves"))
     except Exception as e:
-        out.append(("dashboard_ok", False, "CRIT", f"/camp not serving: {e}"))
+        out.append(("dashboard_ok", False, "CRIT", f"{page_url} not serving: {e}"))
     return out
 
 
@@ -101,39 +102,51 @@ def _ask_claude(status, failed, s):
 
 def main():
     ts = datetime.now(PT).strftime("%Y-%m-%d %H:%M") if PT else str(datetime.now())
-    try:
-        s = json.loads(config.STATUS_JSON.read_text())
-    except Exception as e:
-        health = {"status": "BROKEN", "summary": f"status.json unreadable: {e}",
-                  "diagnosis": "The scan never produced output — check that camp_agent.py cron ran.",
-                  "generated": ts, "ts": int(time.time())}
-        config.HEALTH_JSON.write_text(json.dumps(health, indent=2))
-        print("doctor: BROKEN — status.json unreadable")
-        return
+    locs = locations.load_locations()
+    per, worst, worst_failed, worst_status = {}, "HEALTHY", [], None
+    RANK = {"HEALTHY": 0, "DEGRADED": 1, "BROKEN": 2}
+    for loc in locs:
+        try:
+            s = json.loads(loc.status_json.read_text())
+        except Exception as e:
+            per[loc.slug] = {"status": "BROKEN", "summary": f"status.json unreadable: {e}"}
+            worst = "BROKEN"
+            continue
+        checks = _checks(s, page_url=f"http://127.0.0.1:5001/camp/{loc.slug}")
+        status, failed = _verdict(checks)
+        per[loc.slug] = {
+            "status": status,
+            "summary": ("all systems nominal" if status == "HEALTHY"
+                        else ", ".join(f"{n} failed" for n, ok, sev, d in failed)),
+            "checks": [{"name": n, "ok": ok, "severity": sev, "detail": d}
+                       for n, ok, sev, d in checks],
+        }
+        if RANK[status] > RANK[worst]:
+            worst, worst_failed, worst_status = status, failed, s
 
-    checks = _checks(s)
-    status, failed = _verdict(checks)
-    summary = ("all systems nominal" if status == "HEALTHY"
-               else ", ".join(f"{n} failed" for n, ok, sev, d in failed))
+    summary = ("all systems nominal" if worst == "HEALTHY" else
+               "; ".join(f"[{slug}] {v['summary']}" for slug, v in per.items()
+                         if v["status"] != "HEALTHY"))
     diagnosis = ""
-    if status != "HEALTHY":
-        diagnosis = _ask_claude(status, failed, s)
+    if worst != "HEALTHY" and worst_status is not None:
+        diagnosis = _ask_claude(worst, worst_failed, worst_status)
 
     health = {
-        "status": status, "summary": summary, "diagnosis": diagnosis,
-        "checks": [{"name": n, "ok": ok, "severity": sev, "detail": d}
-                   for n, ok, sev, d in checks],
+        "status": worst, "summary": summary, "diagnosis": diagnosis,
+        "locations": per,
         "generated": ts, "ts": int(time.time()),
     }
     config.HEALTH_JSON.write_text(json.dumps(health, indent=2))
 
-    # Re-render so the banner reflects the latest verdict.
-    try:
-        camp_agent.render_html(s)
-    except Exception as e:
-        print(f"doctor: re-render failed: {e}")
+    # Re-render every location so the banner reflects the latest verdict.
+    for loc in locs:
+        try:
+            s = json.loads(loc.status_json.read_text())
+            camp_agent.render_html(s, loc, locs)
+        except Exception as e:
+            print(f"doctor: re-render {loc.slug} failed: {e}")
 
-    line = f"{ts} [INFO] CampSage doctor: {status} — {summary}"
+    line = f"{ts} [INFO] CampSage doctor: {worst} — {summary}"
     try:
         with open(config.LOG_FILE, "a") as f:
             f.write(line + "\n")
