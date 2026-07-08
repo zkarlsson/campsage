@@ -28,8 +28,10 @@ Region tabs are statewide: only anchors within ~300 mi of a location are searche
 Oakland scan gets Point Reyes/Tahoe/Big Sur tabs while an LA scan keeps Big Bear/Ojai/Joshua
 Tree — API load stays flat per location.
 
-Docker: `docker compose up -d --build` (web on :5055 host-side; scanner runs 7:00/13:00/18:00 PT
-via supercronic and scans all locations sequentially).
+Docker: `docker compose up -d --build` (web on :5055 host-side; scanner runs 3×/day via
+supercronic with jittered start times — shortly after 7am PT for the rolling release, plus
+two floating cancellation sweeps in the 12:00–14:00 and 17:00–19:00 windows — scanning all
+locations sequentially with randomized pacing/pull shape).
 Run `camp_agent.py` on a cron (e.g. a few times a day) to keep results fresh. Add the page to your
 phone's Home Screen. Every card has a green **Book on Recreation.gov →** button, a **See calendar**
 link, and **Directions**.
@@ -91,10 +93,13 @@ links open on the phone where the user is logged in and get real results every t
 Everything is in `config.py`: home base, max distance, rating bars, window length, nights
 (`NIGHTS=[3,2]`), `WEEKENDS_ONLY`. Edit and re-run `python3 camp_agent.py`.
 
-## Cron (Pacific, in `crontab -l`)
-- `camp_agent.py` at **7:00 / 13:00 / 18:00** (7am catches recreation.gov's rolling 6-month
-  release; midday + evening catch cancellations).
-- `ai_concierge.sh` at **7:10** (subscription tips refresh).
+## Schedule (Pacific, `crontab.scan` via supercronic)
+- `camp_agent.py` 3×/day with **jittered starts**: ~7:05–7:25 (catches recreation.gov's
+  rolling 6-month release soon after the 7am drop), plus floating sweeps in the
+  12:00–14:00 and 17:00–19:00 windows (cancellations). Start time, request pacing, pull
+  size, and fetch order all vary run-to-run.
+- `scan_pending.py` every minute (no-op unless a location was just added via the web UI).
+- `ai_concierge.sh` (subscription tips refresh) — host-side, not in the container stack.
 
 ## Validate
 `python3 selftest.py` — checks the live API, freshness, sort/distance/rating/nights invariants,
