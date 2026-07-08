@@ -11,6 +11,7 @@ Data source: recreation.gov public JSON endpoints (no API key):
 Pure standard library. Run:  python3 camp_agent.py
 """
 import json
+import random
 import re
 import sys
 import time
@@ -49,8 +50,8 @@ AVAIL_PAGE = "https://www.recreation.gov/camping/campgrounds/{cid}/availability"
 # enough to outlive a throttle window instead of burning the retry budget in seconds.
 _PACE_LOCK = None
 _PACE_LAST = [0.0]
-MIN_REQUEST_SPACING_S = 1.0
-RATE_LIMIT_RETRIES = 5
+MIN_REQUEST_SPACING_S = 1.0     # re-randomized per run (see scan()) so the traffic
+RATE_LIMIT_RETRIES = 5          # cadence isn't a constant, fingerprint-able rhythm
 
 
 def _pace():
@@ -480,7 +481,8 @@ def cap_destination_candidates(candidates, anchors, log=lambda *_: None):
     import math
     everyday = [c for c in candidates if not c.get("_destination")]
     dest = [c for c in candidates if c.get("_destination")]
-    per_cap = config.REGION_MAX_PER_TAB + 4          # spare for full/no-opening spots
+    # Spare varies per run (pull size shouldn't be byte-identical day after day).
+    per_cap = config.REGION_MAX_PER_TAB + random.randint(2, 7)
     by_region = {}
     for c in dest:
         try:
@@ -530,9 +532,10 @@ def analyze_candidates(candidates, months, win_start, win_end, errors, retry_wai
     months are served from memory); only both-pass failures are reported as errors."""
     out, failed = _analyze_pass(candidates, months, win_start, win_end)
     if failed and retry_wait:
+        wait = retry_wait * random.uniform(0.8, 1.5)
         log(f"  {len(failed)} availability fetches failed — retrying after "
-            f"{retry_wait // 60} min quota-window pause…")
-        time.sleep(retry_wait)
+            f"{wait / 60:.0f} min quota-window pause…")
+        time.sleep(wait)
         more, failed = _analyze_pass([c for c, _ in failed], months, win_start, win_end)
         out += more
     for c, err in failed:
@@ -559,6 +562,8 @@ def run(loc, all_locs=None):
     log(f"  {len(raw)} campgrounds found, {len(candidates)} pass reviews+distance filter "
         f"({ndest} far-destination finds)")
     candidates = cap_destination_candidates(candidates, anchors, log)
+    random.shuffle(candidates)      # vary fetch order run-to-run (also spreads which
+                                    # campgrounds sit at the quota edge across runs)
 
     # Fetch availability in parallel.
     analyzed = analyze_candidates(candidates, months, win_start, win_end, errors)
@@ -1114,14 +1119,16 @@ def scan(only_slugs=None):
     """Scan saved locations sequentially, holding the scan lock for the whole run —
     scans must NEVER overlap (recreation.gov's per-IP quota punishes concurrency).
     The store is re-checked before each location so a removal made from the web UI
-    mid-run is honored."""
-    global LOG_PREFIX
+    mid-run is honored. Pace and gaps are re-randomized each run so the traffic
+    doesn't repeat an identical daily shape."""
+    global LOG_PREFIX, MIN_REQUEST_SPACING_S
     locs = locations.load_locations()      # resolves store; exits loudly on failure
     todo = [l for l in locs if l.slug in only_slugs] if only_slugs else locs
     if only_slugs and not todo:
         sys.exit(f"unknown location(s) {only_slugs!r}; "
                  f"saved: {', '.join(l.slug for l in locs)}")
     with locations.scan_lock(blocking=True):
+        MIN_REQUEST_SPACING_S = random.uniform(0.8, 1.4)
         first = True
         for loc in todo:
             current = {l.slug for l in locations.load_locations()}
@@ -1129,7 +1136,7 @@ def scan(only_slugs=None):
                 log(f"[{loc.slug}] removed while waiting — skipping")
                 continue
             if not first:
-                time.sleep(120)            # let the API's trailing quota window slide
+                time.sleep(random.uniform(90, 240))   # quota window slides; gap varies
             first = False
             LOG_PREFIX = f"[{loc.slug}] " if len(locs) > 1 else ""
             status = run(loc, locations.load_locations())
@@ -1139,7 +1146,16 @@ def scan(only_slugs=None):
 
 
 def main():
-    only = sys.argv[sys.argv.index("--location") + 1] if "--location" in sys.argv else None
+    args = sys.argv
+    only = args[args.index("--location") + 1] if "--location" in args else None
+    # --jitter MIN-MAX (seconds): sleep a random amount BEFORE taking the scan lock,
+    # so scheduled scans don't land at the same second every day (and a sleeping cron
+    # job never blocks a web-triggered pending scan).
+    if "--jitter" in args:
+        lo, hi = (int(x) for x in args[args.index("--jitter") + 1].split("-"))
+        delay = random.uniform(lo, hi)
+        log(f"jitter: sleeping {delay / 60:.0f} min before scan")
+        time.sleep(delay)
     scan([only] if only else None)
 
 

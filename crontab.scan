@@ -1,6 +1,10 @@
-# CampSage scan schedule (container TZ=America/Los_Angeles).
-# 7am catches recreation.gov's rolling 6-month release; midday + evening catch cancellations.
-0 7,13,18 * * * cd /app && python3 camp_agent.py && python3 camp_wiki_images.py
+# CampSage scan schedule (container TZ=America/Los_Angeles). Start times are
+# jittered (--jitter MIN-MAX seconds) so runs never land at the same moment daily.
+# Morning stays NEAR 7am (small jitter) to catch recreation.gov's rolling 6-month
+# release soon after it drops; midday/evening are loose cancellation sweeps.
+0 7 * * *  cd /app && python3 camp_agent.py --jitter 300-1500 && python3 camp_wiki_images.py
+0 12 * * * cd /app && python3 camp_agent.py --jitter 0-7200  && python3 camp_wiki_images.py
+0 17 * * * cd /app && python3 camp_agent.py --jitter 0-7200  && python3 camp_wiki_images.py
 # Pick up locations added from the web UI (exits instantly when none are pending;
 # queues behind any running scan via the scan lock — scans never overlap).
 * * * * * cd /app && python3 scan_pending.py

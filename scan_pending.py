@@ -7,6 +7,7 @@ retries), and a successful scan clears it via update_index. Exits instantly when
 there's nothing to do; skips (and retries next minute) if a scan already holds the
 lock — pending scans must queue behind the 7/13/18 cron scans, never overlap them.
 """
+import random
 import sys
 import time
 
@@ -37,7 +38,7 @@ def main():
         first = True
         for loc in (l for l in locs if l.slug in todo):
             if not first:
-                time.sleep(120)
+                time.sleep(random.uniform(90, 240))
             first = False
             camp_agent.LOG_PREFIX = f"[{loc.slug}] "
             status = camp_agent.run(loc, locs)
